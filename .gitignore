@@ -1,0 +1,4 @@
+.venv/
+__pycache__/
+data/models/
+.DS_Store

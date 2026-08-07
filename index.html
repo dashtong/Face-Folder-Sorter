@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Face Folder Sorter</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <div class="bar">
+      <div class="brand">Face <b>Folder</b> Sorter</div>
+      <div class="stats" id="stats">Loading…</div>
+      <label class="control">
+        Max names in prefix
+        <input id="maxNames" type="number" min="0" max="100" value="5">
+      </label>
+      <button class="primary" id="confirm">Confirm &amp; rename</button>
+    </div>
+  </header>
+  <main>
+    <div class="hint">
+      Rename a group in its heading. Drag a face between groups, or right-click
+      a face and choose its destination. All non-DROP names are embedded as
+      searchable metadata; the maximum above limits only the filename prefix.
+    </div>
+    <div class="groups" id="groups"></div>
+  </main>
+</body>
+</html>
