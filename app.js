@@ -1,6 +1,7 @@
 let data;
 let assignments = {};
 let names = [];
+let personRenames = {};
 
 const groupsElement = document.querySelector("#groups");
 const escapeHtml = (value) => String(value).replace(
@@ -27,6 +28,7 @@ function render() {
     .sort((left, right) => left === "DROP" ? 1 : right === "DROP" ? -1 : left.localeCompare(right));
   document.querySelector("#stats").textContent =
     `${data.faces.length} faces · ${data.images} images · ${names.length} groups` +
+    (data.knownPeople ? ` · ${data.knownPeople} saved people` : "") +
     (data.errors ? ` · ${data.errors} unreadable` : "");
   groupsElement.innerHTML = names.map(groupMarkup).join("");
   bindGroupEvents();
@@ -35,9 +37,17 @@ function render() {
 function groupMarkup(name) {
   const faces = data.faces.filter((face) => assignments[face.id] === name);
   const isDrop = name === "DROP";
+  const knownIds = [...new Set(
+    faces.map((face) => face.knownPersonId).filter((id) => id !== null)
+  )];
+  const knownPersonId =
+    knownIds.length === 1 &&
+    faces.every((face) => face.knownPersonId === knownIds[0])
+      ? knownIds[0]
+      : null;
   const heading = isDrop
     ? '<div class="group-name">DROP</div>'
-    : `<input class="group-name" value="${escapeHtml(name)}" data-old="${escapeHtml(name)}" aria-label="Group name">`;
+    : `<input class="group-name" value="${escapeHtml(name)}" data-old="${escapeHtml(name)}" ${knownPersonId === null ? "" : `data-person-id="${knownPersonId}"`} aria-label="Group name">`;
   const cards = faces.map((face) => `
     <figure class="face ${face.lowQuality ? "low" : ""}" draggable="true" data-id="${face.id}" title="${escapeHtml(face.file)}">
       <img src="${face.crop}" loading="lazy">
@@ -59,6 +69,7 @@ function bindGroupEvents() {
       const oldName = input.dataset.old;
       const value = input.value.trim();
       if (!value) { input.value = oldName; return; }
+      if (input.dataset.personId) personRenames[input.dataset.personId] = value;
       Object.keys(assignments).forEach((id) => {
         if (assignments[id] === oldName) assignments[id] = value;
       });
@@ -118,7 +129,11 @@ document.querySelector("#confirm").onclick = async () => {
     const response = await fetch("/api/confirm", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ assignments, maxNames: Number(document.querySelector("#maxNames").value) }),
+      body: JSON.stringify({
+        assignments,
+        personRenames,
+        maxNames: Number(document.querySelector("#maxNames").value),
+      }),
     });
     const result = await response.json();
     if (!response.ok) throw Error(result.error || "Save failed");
@@ -126,7 +141,12 @@ document.querySelector("#confirm").onclick = async () => {
     let extra = ` Metadata written to ${result.metadataWritten} images.`;
     if (result.metadataSkipped.length) extra += ` ${result.metadataSkipped.length} unsupported format(s) skipped: ${result.metadataSkipped.join(", ")}.`;
     if (result.metadataErrors.length) extra += ` Metadata errors: ${result.metadataErrors.join(" | ")}`;
-    toast(`Renamed ${result.renamed} files; ${result.unchanged} unchanged.${extra}`, result.metadataErrors.length > 0);
+    extra += ` Remembered ${result.databaseSaved} reviewed face${result.databaseSaved === 1 ? "" : "s"}.`;
+    if (result.databaseError) extra += ` Database error: ${result.databaseError}`;
+    toast(
+      `Renamed ${result.renamed} files; ${result.unchanged} unchanged.${extra}`,
+      result.metadataErrors.length > 0 || Boolean(result.databaseError),
+    );
   } catch (error) {
     button.disabled = false;
     button.textContent = "Confirm & rename";

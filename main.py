@@ -1,8 +1,10 @@
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import struct
 import sys
 import threading
@@ -21,6 +23,8 @@ PROJECT_DIR = Path(__file__).resolve().parent
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 DROP_GROUP = "DROP"
+AUTO_PERSON_NAME = re.compile(r"Person \d{3}$")
+DEFAULT_DATABASE_PATH = PROJECT_DIR / "data" / "people.sqlite3"
 
 
 @dataclass(slots=True)
@@ -39,6 +43,7 @@ class ScannedFace:
     embedding: np.ndarray
     group: str = ""
     low_quality: bool = False
+    known_person_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -58,6 +63,143 @@ class ScanResult:
     faces: list[ScannedFace]
 
 
+class PersonDatabase:
+    """Persistent names and ArcFace embeddings stored on this computer."""
+
+    def __init__(self, path: Path):
+        self.path = path.expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS people (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS face_embeddings (
+                    fingerprint TEXT PRIMARY KEY,
+                    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+                    dimension INTEGER NOT NULL,
+                    embedding BLOB NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS face_embeddings_person
+                    ON face_embeddings(person_id);
+                """
+            )
+
+    def centroids(self) -> list[tuple[int, str, np.ndarray]]:
+        grouped: dict[tuple[int, str], list[np.ndarray]] = {}
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT people.id, people.name, face_embeddings.dimension,
+                       face_embeddings.embedding
+                FROM people
+                JOIN face_embeddings ON face_embeddings.person_id = people.id
+                ORDER BY people.id
+                """
+            )
+            for person_id, name, dimension, blob in rows:
+                vector = np.frombuffer(blob, dtype=np.float32)
+                if vector.size == dimension:
+                    grouped.setdefault((person_id, name), []).append(vector)
+        return [
+            (person_id, name, normalize(np.mean(vectors, axis=0)))
+            for (person_id, name), vectors in grouped.items()
+            if vectors
+        ]
+
+    def save_review(
+        self,
+        faces: list[ScannedFace],
+        assignments: dict[str, str],
+        person_renames: dict[int, str],
+    ) -> int:
+        """Apply explicit person renames and learn every reviewed named face."""
+        saved = 0
+        with self._connect() as connection:
+            for person_id, requested_name in person_renames.items():
+                name = sanitize_person_name(requested_name)
+                if not is_database_name(name):
+                    continue
+                row = connection.execute(
+                    "SELECT id FROM people WHERE name = ? COLLATE NOCASE", (name,)
+                ).fetchone()
+                if row and row[0] != person_id:
+                    target_id = int(row[0])
+                    connection.execute(
+                        "UPDATE OR REPLACE face_embeddings SET person_id = ? WHERE person_id = ?",
+                        (target_id, person_id),
+                    )
+                    connection.execute("DELETE FROM people WHERE id = ?", (person_id,))
+                else:
+                    connection.execute(
+                        "UPDATE people SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (name, person_id),
+                    )
+
+            for face in faces:
+                vector = np.asarray(face.embedding, dtype=np.float32).reshape(-1)
+                blob = vector.tobytes()
+                fingerprint = hashlib.sha256(blob).hexdigest()
+                name = sanitize_person_name(assignments.get(face.id, face.group))
+                if not is_database_name(name):
+                    connection.execute(
+                        "DELETE FROM face_embeddings WHERE fingerprint = ?", (fingerprint,)
+                    )
+                    continue
+                row = connection.execute(
+                    "SELECT id FROM people WHERE name = ? COLLATE NOCASE", (name,)
+                ).fetchone()
+                if row:
+                    person_id = int(row[0])
+                else:
+                    cursor = connection.execute(
+                        "INSERT INTO people(name) VALUES (?)", (name,)
+                    )
+                    person_id = int(cursor.lastrowid)
+                connection.execute(
+                    """
+                    INSERT INTO face_embeddings(fingerprint, person_id, dimension, embedding)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(fingerprint) DO UPDATE SET
+                        person_id = excluded.person_id,
+                        dimension = excluded.dimension,
+                        embedding = excluded.embedding
+                    """,
+                    (fingerprint, person_id, vector.size, blob),
+                )
+                connection.execute(
+                    "UPDATE people SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (person_id,),
+                )
+                saved += 1
+            connection.execute(
+                "DELETE FROM people WHERE NOT EXISTS "
+                "(SELECT 1 FROM face_embeddings WHERE person_id = people.id)"
+            )
+        return saved
+
+
+def is_database_name(name: str) -> bool:
+    return (
+        bool(name)
+        and name not in {DROP_GROUP, "Too far", "Ungroupable"}
+        and not AUTO_PERSON_NAME.fullmatch(name)
+    )
+
+
 class InsightFaceBackend:
     """Multi-scale SCRFD detection and ArcFace embeddings."""
 
@@ -67,7 +209,31 @@ class InsightFaceBackend:
         detection_threshold: float,
     ):
         try:
+            if os.name == "nt":
+                # cuDNN 9 is split into DLLs that it loads lazily during the
+                # first inference. Keep its pip-installed bin directory in
+                # this process's PATH so those engine DLLs remain discoverable.
+                cudnn_bin = (
+                    Path(sys.prefix)
+                    / "Lib"
+                    / "site-packages"
+                    / "nvidia"
+                    / "cudnn"
+                    / "bin"
+                )
+                if cudnn_bin.is_dir():
+                    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+                    if str(cudnn_bin) not in path_entries:
+                        os.environ["PATH"] = (
+                            str(cudnn_bin)
+                            + os.pathsep
+                            + os.environ.get("PATH", "")
+                        )
             import onnxruntime as ort
+
+            # Right-click launches a fresh Python process, so CUDA/cuDNN DLLs
+            # installed in this virtual environment must be loaded here.
+            ort.preload_dlls(directory="")
             from insightface.app import FaceAnalysis
         except ImportError as exc:
             raise RuntimeError(
@@ -172,10 +338,12 @@ def scan_folder(
     backend: InsightFaceBackend,
     similarity_threshold: float,
     min_face_pixels: int,
+    known_people: list[tuple[int, str, np.ndarray]] | None = None,
+    selected_paths: list[Path] | None = None,
     progress=None,
 ) -> ScanResult:
     root = root.expanduser().resolve()
-    paths = image_paths(root)
+    paths = image_paths(root) if selected_paths is None else sorted(selected_paths)
     images: list[ScannedImage] = []
     faces: list[ScannedFace] = []
     for position, path in enumerate(paths, 1):
@@ -217,16 +385,33 @@ def scan_folder(
             )
         if progress:
             progress(position, len(paths), path)
-    cluster_faces(faces, similarity_threshold)
+    cluster_faces(faces, similarity_threshold, known_people or [])
     return ScanResult(root, images, faces)
 
 
-def cluster_faces(faces: list[ScannedFace], similarity_threshold: float) -> None:
+def cluster_faces(
+    faces: list[ScannedFace],
+    similarity_threshold: float,
+    known_people: list[tuple[int, str, np.ndarray]] | None = None,
+) -> None:
     usable = sorted(
         (face for face in faces if not face.low_quality),
         key=lambda face: face.score,
         reverse=True,
     )
+    known_people = known_people or []
+    if known_people:
+        known_centroids = [item[2] for item in known_people]
+        for face in usable:
+            similarities = np.asarray(
+                [float(np.dot(face.embedding, centroid)) for centroid in known_centroids]
+            )
+            best = int(np.argmax(similarities))
+            if float(similarities[best]) >= similarity_threshold:
+                person_id, name, _ = known_people[best]
+                face.group = name
+                face.known_person_id = person_id
+    usable = [face for face in usable if face.known_person_id is None]
     clusters: list[list[ScannedFace]] = []
     centroids: list[np.ndarray] = []
     for face in usable:
@@ -461,6 +646,12 @@ def parse_args() -> argparse.Namespace:
         description="Group every face in an image folder and review names in a browser."
     )
     parser.add_argument("folder", type=Path, nargs="?", help="Folder scanned recursively")
+    parser.add_argument(
+        "--files",
+        type=Path,
+        nargs="+",
+        help="Scan only these selected image files",
+    )
     context_menu = parser.add_mutually_exclusive_group()
     context_menu.add_argument(
         "--install-context-menu",
@@ -481,6 +672,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated detection resolutions (default: 640,1280)",
     )
     parser.add_argument("--detection-threshold", type=float, default=0.35, help="Minimum detection confidence (default: 0.35)")
+    parser.add_argument(
+        "--database",
+        type=Path,
+        default=DEFAULT_DATABASE_PATH,
+        help=f"Local person database (default: {DEFAULT_DATABASE_PATH})",
+    )
     return parser.parse_args()
 
 
@@ -494,12 +691,39 @@ def main() -> int:
         uninstall_context_menu()
         print("Removed Face Folder Sorter from the Windows folder context menu.")
         return 0
-    if args.folder is None:
-        raise SystemExit("error: provide a folder or use --install-context-menu")
-    folder = args.folder.expanduser().resolve()
-    if not folder.is_dir():
-        raise SystemExit(f"error: not a folder: {folder}")
-    print(f"Scanning images recursively in {folder}")
+    if args.folder is not None and args.files:
+        raise SystemExit("error: provide either a folder or --files, not both")
+    selected_paths = None
+    if args.files:
+        selected_paths = list(
+            dict.fromkeys(path.expanduser().resolve() for path in args.files)
+        )
+        invalid = [
+            path
+            for path in selected_paths
+            if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES
+        ]
+        if invalid:
+            raise SystemExit(
+                "error: unsupported or missing selected file(s): "
+                + ", ".join(str(path) for path in invalid)
+            )
+        try:
+            folder = Path(
+                os.path.commonpath([str(path.parent) for path in selected_paths])
+            )
+        except ValueError:
+            raise SystemExit("error: selected images must be on the same drive")
+        print(f"Scanning {len(selected_paths)} selected image(s)")
+    else:
+        if args.folder is None:
+            raise SystemExit(
+                "error: provide a folder, --files, or use --install-context-menu"
+            )
+        folder = args.folder.expanduser().resolve()
+        if not folder.is_dir():
+            raise SystemExit(f"error: not a folder: {folder}")
+        print(f"Scanning images recursively in {folder}")
     try:
         detector_sizes = tuple(
             dict.fromkeys(int(value.strip()) for value in args.detector_sizes.split(","))
@@ -512,23 +736,27 @@ def main() -> int:
         detector_sizes=detector_sizes,
         detection_threshold=args.detection_threshold,
     )
+    database = PersonDatabase(args.database)
+    known_people = database.centroids()
     scan = scan_folder(
         folder,
         backend,
         similarity_threshold=args.similarity,
         min_face_pixels=args.min_face_pixels,
+        known_people=known_people,
+        selected_paths=selected_paths,
         progress=lambda done, total, path: print(f"[{done}/{total}] {path.name}", flush=True),
     )
     if not scan.images:
         raise SystemExit("error: no supported images found")
-    app = ReviewApplication(scan)
+    app = ReviewApplication(scan, database)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(app))
     url = f"http://127.0.0.1:{server.server_address[1]}"
     print(f"Detected {len(scan.faces)} face(s) in {len(scan.images)} image(s).")
+    print(f"Loaded {len(known_people)} known person(s) from {database.path}")
     print(f"Review the results at {url}")
     print("Keep this terminal open until you click Confirm & rename.")
-    if not args.no_browser:
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -546,19 +774,39 @@ def install_context_menu() -> None:
     python = PROJECT_DIR / ".venv" / "Scripts" / "python.exe"
     if not python.exists():
         python = Path(sys.executable).resolve()
+    pythonw = python.with_name("pythonw.exe")
     script = Path(__file__).resolve()
+    selection_helper = PROJECT_DIR / "context_menu.py"
+    icon = PROJECT_DIR / "assets" / "face-folder-sorter-woman.ico"
+    icon_path = icon if icon.exists() else python
     entries = (
-        (r"Software\Classes\Directory\shell\FaceFolderSorter", "%1"),
-        (r"Software\Classes\Directory\Background\shell\FaceFolderSorter", "%V"),
+        (
+            r"Software\Classes\Directory\shell\FaceFolderSorter",
+            "Sort photos by face",
+            f'cmd.exe /d /s /c ""{python}" "{script}" "%1" || pause"',
+            False,
+        ),
+        (
+            r"Software\Classes\Directory\Background\shell\FaceFolderSorter",
+            "Sort photos by face",
+            f'cmd.exe /d /s /c ""{python}" "{script}" "%V" || pause"',
+            False,
+        ),
+        (
+            r"Software\Classes\SystemFileAssociations\image\shell\FaceFolderSorter",
+            "Sort selected photos by face",
+            f'"{pythonw}" "{selection_helper}" "%1"',
+            True,
+        ),
     )
-    for key_path, folder_placeholder in entries:
+    for key_path, label, command, supports_multiple in entries:
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
-            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "Sort photos by face")
-            winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, str(python))
-        command = (
-            f'cmd.exe /d /s /c ""{python}" "{script}" '
-            f'"{folder_placeholder}" || pause"'
-        )
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, label)
+            winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, str(icon_path))
+            if supports_multiple:
+                winreg.SetValueEx(
+                    key, "MultiSelectModel", 0, winreg.REG_SZ, "Player"
+                )
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path + r"\command") as key:
             winreg.SetValueEx(key, "", 0, winreg.REG_SZ, command)
 
@@ -571,6 +819,7 @@ def uninstall_context_menu() -> None:
     entries = (
         r"Software\Classes\Directory\shell\FaceFolderSorter",
         r"Software\Classes\Directory\Background\shell\FaceFolderSorter",
+        r"Software\Classes\SystemFileAssociations\image\shell\FaceFolderSorter",
     )
     for key_path in entries:
         try:
@@ -581,8 +830,9 @@ def uninstall_context_menu() -> None:
 
 
 class ReviewApplication:
-    def __init__(self, scan: ScanResult):
+    def __init__(self, scan: ScanResult, database: PersonDatabase):
         self.scan = scan
+        self.database = database
         self.faces = {face.id: face for face in scan.faces}
         self.crop_cache: dict[str, bytes] = {}
         self.confirmed = False
@@ -594,6 +844,7 @@ class ReviewApplication:
             "root": str(self.scan.root),
             "images": len(self.scan.images),
             "errors": sum(image.error is not None for image in self.scan.images),
+            "knownPeople": len(self.database.centroids()),
             "faces": [
                 {
                     "id": face.id,
@@ -602,6 +853,7 @@ class ReviewApplication:
                     "group": face.group,
                     "score": round(face.score, 3),
                     "lowQuality": face.low_quality,
+                    "knownPersonId": face.known_person_id,
                     "crop": f"/crop?id={face.id}",
                 }
                 for face in self.scan.faces
@@ -623,6 +875,24 @@ class ReviewApplication:
                     raise ValueError
             except (TypeError, ValueError):
                 return {"ok": False, "error": "Maximum names must be from 0 to 100."}
+            raw_person_renames = payload.get("personRenames", {})
+            if not isinstance(raw_person_renames, dict):
+                return {"ok": False, "error": "Saved person renames must be an object."}
+            try:
+                person_renames = {
+                    int(person_id): name
+                    for person_id, name in raw_person_renames.items()
+                    if isinstance(name, str)
+                }
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "A saved person ID is invalid."}
+            known_person_ids = {
+                face.known_person_id
+                for face in self.scan.faces
+                if face.known_person_id is not None
+            }
+            if not set(person_renames).issubset(known_person_ids):
+                return {"ok": False, "error": "A saved person ID is not in this scan."}
             try:
                 plan = build_rename_plan(self.scan, assignments, max_names)
                 renamed = apply_rename_plan(plan)
@@ -654,6 +924,14 @@ class ReviewApplication:
                         metadata_skipped.append(current_path.name)
                 except Exception as exc:
                     metadata_errors.append(f"{current_path.name}: {exc}")
+            database_saved = 0
+            database_error = ""
+            try:
+                database_saved = self.database.save_review(
+                    self.scan.faces, assignments, person_renames
+                )
+            except Exception as exc:
+                database_error = str(exc)
             self.confirmed = True
             return {
                 "ok": True,
@@ -662,6 +940,8 @@ class ReviewApplication:
                 "metadataWritten": metadata_written,
                 "metadataSkipped": metadata_skipped,
                 "metadataErrors": metadata_errors,
+                "databaseSaved": database_saved,
+                "databaseError": database_error,
             }
 
 
